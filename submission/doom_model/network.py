@@ -140,12 +140,16 @@ class AgentNet(nn.Module):
 
     def core(self, x, h, starts):
         """x: (T,B,D); starts: (T,B) 1 where obs t begins a new episode (state reset before step t)."""
-        if not bool(starts[1:].any()):
-            return self.gru(x, h * (1 - starts[0])[None, :, None])
+        # Split the sequence only at timesteps where SOME env starts an episode and run the cuDNN GRU on
+        # each segment. Inside a segment no state is reset except at its first step, so this is exactly
+        # the per-step loop (reset h where starts[t]==1, then step), with ~#resets+1 GRU calls instead of T.
+        # Equivalence: training/tests/test_core_segments.py.
+        cuts = (starts[1:].sum(1) > 0).nonzero().flatten().add(1).tolist()
+        bounds = [0] + cuts + [x.shape[0]]
         outs = []
-        for t in range(x.shape[0]):
-            h = h * (1 - starts[t])[None, :, None]
-            o, h = self.gru(x[t:t + 1], h)
+        for t0, t1 in zip(bounds[:-1], bounds[1:]):
+            h = h * (1 - starts[t0])[None, :, None]
+            o, h = self.gru(x[t0:t1], h)
             outs.append(o)
         return torch.cat(outs), h
 
