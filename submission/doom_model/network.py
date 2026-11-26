@@ -20,11 +20,11 @@ import torch.nn as nn
 
 from .actions import N_ACTIONS
 from .config import ModelConfig
-from .features import CROP, MAP_CH
+from .features import CROP, MAP_CH, PIX_H, PIX_W
 
 
 class Encoder(nn.Module):
-    def __init__(self, dim: int, use_map: bool):
+    def __init__(self, dim: int, use_map: bool, use_pixels: bool = False):
         super().__init__()
         def c1(i, o):
             return nn.Sequential(nn.Conv1d(i, o, 5, padding=2, padding_mode="circular"), nn.ReLU())
@@ -42,6 +42,19 @@ class Encoder(nn.Module):
                 nn.Conv2d(64, 64, 3, 2, 1), nn.ReLU(), nn.Flatten(), nn.Linear(64 * (CROP // 8) ** 2, 128), nn.ReLU())
             map_out = 128
         self.out = nn.Sequential(nn.Linear(256 + 128 + 64 + map_out, dim), nn.ReLU())
+        self.use_pixels = use_pixels
+        if use_pixels:
+            # Conv stack of Sample Factory's VizDoom encoder (App. A.1.3 / Fig. A.1: 8x8/4, 4x4/2, 3x3/2,
+            # 32/64/128 filters) on rgb+depth at 60x80. Its projection into the embedding is ZERO-initialised
+            # and added before the encoder's ReLU, so a network warm-started from a no-pixel checkpoint
+            # computes exactly the same function until training moves the projection.
+            self.pix = nn.Sequential(
+                nn.Conv2d(4, 32, 8, 4), nn.ReLU(), nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
+                nn.Conv2d(64, 128, 3, 2), nn.ReLU(), nn.Flatten())
+            with torch.no_grad():
+                n_flat = self.pix(torch.zeros(1, 4, PIX_H, PIX_W)).shape[1]
+            self.pix_proj = nn.Linear(n_flat, dim)
+            nn.init.zeros_(self.pix_proj.weight); nn.init.zeros_(self.pix_proj.bias)
 
     def forward(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
         lead = o["dist"].shape[:-1]
@@ -56,7 +69,10 @@ class Encoder(nn.Module):
         parts = [r, e_mean, e_max, v]
         if self.use_map:
             parts.append(self.map(f(o["crops"], 2 * MAP_CH, CROP, CROP).float() / 255.0))
-        return self.out(torch.cat(parts, -1)).reshape(*lead, -1)
+        pre = self.out[0](torch.cat(parts, -1))
+        if self.use_pixels:
+            pre = pre + self.pix_proj(self.pix(f(o["pix"], 4, PIX_H, PIX_W).float() / 255.0))
+        return self.out[1](pre).reshape(*lead, -1)
 
 
 class EpisodicReader(nn.Module):
@@ -98,7 +114,7 @@ class AgentNet(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.enc = Encoder(cfg.embed, cfg.use_map)
+        self.enc = Encoder(cfg.embed, cfg.use_map, cfg.use_pixels)
         self.gru = nn.GRU(cfg.embed, cfg.hidden)
         self.epi = EpisodicReader(cfg.hidden) if cfg.use_episodic else None
         z = cfg.hidden + (self.epi.dv if self.epi else 0)

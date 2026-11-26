@@ -28,8 +28,19 @@ from .actions import ACTIONS
 VITALS_SCALE = np.array([100, 100, 7, 50, 200, 50, 50, 300, 1, 1, 1, 1, 1, 1, 8, 8, 8], np.float32)
 
 
+PIX_H, PIX_W = 60, 80
+
+
+def pixels(obs: dict) -> np.ndarray:
+    """rgb (120x160x3) + depth (120x160) -> uint8 (4, 60, 80) by 2x2 subsampling (no interpolation:
+    identical in training and evaluation, and cheap)."""
+    rgb = np.asarray(obs["rgb"])[::2, ::2]
+    depth = np.asarray(obs["depth"])[::2, ::2]
+    return np.concatenate([rgb.transpose(2, 0, 1), depth[None]], 0).astype(np.uint8)
+
+
 def obs_arrays(obs: dict, prev_action: int) -> dict[str, np.ndarray]:
-    """One observation -> flat arrays (no pixels). Batch with np.stack over envs."""
+    """One observation -> flat arrays (no pixels; see pixels()). Batch with np.stack over envs."""
     return {
         "dist": np.asarray(obs["rays"]["distance"], np.float32),
         "hit": np.asarray(obs["rays"]["hit_type"], np.int64),
@@ -164,13 +175,16 @@ class AgentSideFeatures:
     """Call reset(first_obs) at episode start, then step(action_idx, obs) after every env step.
     Each returns the network input arrays for the current observation."""
 
-    def __init__(self, use_map: bool = True):
+    def __init__(self, use_map: bool = True, use_pixels: bool = False):
         self.use_map = use_map
+        self.use_pixels = use_pixels
         self.odo = Odometry()
         self.map = SpatialMap() if use_map else None
 
     def _features(self, obs, prev_action):
         f = obs_arrays(obs, prev_action)
+        if self.use_pixels:
+            f["pix"] = pixels(obs)
         f["pose"] = np.array([self.odo.x, self.odo.y, self.odo.th], np.float32)
         if self.use_map:
             self.map.write((self.odo.x, self.odo.y, self.odo.th), f["dist"], f["hit"])

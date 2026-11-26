@@ -76,18 +76,31 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
     mcfg = ModelConfig(**cfg["model"], head="actor_critic",
                        privileged_dim=PRIV_DIM if cfg.get("asymmetric_critic", True) else 0)
     net = AgentNet(mcfg).to(dev)
+    if cfg.get("init_from"):
+        # Warm start from a submission checkpoint (critic/aux heads were stripped when it was saved; new
+        # modules such as the pixel branch are absent). Anything else missing is an error.
+        state = torch.load(cfg["init_from"], map_location="cpu", weights_only=True)
+        missing, unexpected = net.load_state_dict(state, strict=False)
+        bad = [k for k in missing if not k.startswith(("v.", "aux.", "enc.pix"))]
+        if bad or unexpected:
+            raise RuntimeError(f"init_from mismatch: missing={bad} unexpected={unexpected}")
+        print(f"[warm start] {cfg['init_from']} | fresh: {sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in missing})}",
+              flush=True)
     p = cfg["ppo"]
     opt = torch.optim.Adam(net.parameters(), lr=p["lr"], eps=1e-5)
     N, T = cfg["num_envs"], p["num_steps"]
-    envs = make_envs(cfg, N, mcfg.use_map)      # local process pool or a remote env server
+    envs = make_envs(cfg, N, mcfg.use_map, mcfg.use_pixels)   # local process pool or a remote env server
     outs = envs.reset()
     banks = EpisodicBanks(N, mcfg.episodic_every, mcfg.episodic_slots) if mcfg.use_episodic else None
     h = net.init_state(N, dev)
     start = np.ones(N, np.float32)
-    steps, updates, t0 = 0, 0, time.time()
+    start_step = int(cfg.get("start_step", 0))      # warm start: keeps curriculum stage and step axis
+    steps, updates, t0 = start_step, 0, time.time()
+    envs.set_global_step(steps)
     # CleanRL: num_iterations = total_timesteps // batch_size and frac = 1 - (iteration - 1) / num_iterations,
     # so the last update uses lr/num_iterations > 0 and the budget is never overshot (review fix).
-    n_updates = max(1, cfg["total_steps"] // (N * T))
+    n_updates = max(1, (cfg["total_steps"] - start_step) // (N * T))
+    warmup = int(p.get("critic_warmup_updates", 0)) if cfg.get("init_from") else 0
     tt = lambda x, dt=torch.float32: torch.as_tensor(np.asarray(x), dtype=dt, device=dev)  # noqa: E731
     while updates < n_updates:
         if p.get("anneal_lr", True):
@@ -151,6 +164,11 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
             bh, bp, bt = banks.tensors(dev, mcfg.hidden)
             mem_all = {"t_idx": tt(np.stack(TIDX), torch.long), "bank_h": bh, "bank_pose": bp, "bank_t": bt,
                        "n_valid": tt(np.stack(MEMN), torch.long), "start": tt(np.stack(MEMS), torch.long)}
+        in_warmup = updates < warmup
+        # Critic warm-up after a warm start: only the critic head trains (everything else frozen), so the
+        # policy is exactly the checkpoint's until the fresh critic has caught up.
+        for name, prm in net.named_parameters():
+            prm.requires_grad_(not in_warmup or name.startswith("v."))
         envinds = np.arange(N)
         mb = max(1, N // p["num_minibatches"])
         for _ in range(p["update_epochs"]):
@@ -178,16 +196,18 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
                     vloss = 0.5 * ((v - ret[:, e]) ** 2).mean()
                 ent = dist.entropy().mean()
                 loss = pg - p["ent_coef"] * ent + p["vf_coef"] * vloss
-                if mcfg.aux and cfg.get("aux_coef", 0.0) > 0:
+                if in_warmup:
+                    loss = p["vf_coef"] * vloss
+                elif mcfg.aux and cfg.get("aux_coef", 0.0) > 0:
                     lab = auxs[:, e]
                     pos = lab[..., 0].mean().clamp(0.05, 0.95)            # balanced BCE (review fix)
                     bce = nn.functional.binary_cross_entropy_with_logits(
                         o["aux"][..., 0], lab[..., 0], pos_weight=(1 - pos) / pos)
                     loss = loss + cfg["aux_coef"] * (bce + (o["aux"][..., 1:] - lab[..., 1:]).abs().mean())
-                opt.zero_grad(); loss.backward()
+                opt.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(net.parameters(), p["max_grad_norm"]); opt.step()
         updates += 1
-        log.update(steps, {"pg": pg.item(), "vloss": vloss.item(), "entropy": ent.item(),
+        log.update(steps, {"pg": pg.item(), "vloss": vloss.item(), "entropy": ent.item(), "critic_warmup": float(in_warmup),
                            "lr": opt.param_groups[0]["lr"], "sps": steps / (time.time() - t0), **ram_stats(envs)})
         if updates % cfg.get("save_every_updates", 50) == 0 or updates == n_updates:
             save(net, mcfg, out_dir, steps)

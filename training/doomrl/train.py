@@ -54,10 +54,12 @@ def main():
     ap.add_argument("--num_envs", type=int, default=None, help="override (smoke tests)")
     ap.add_argument("--remote_envs", default=None, help="ip:port of an env server (doomrl.remote_envs); "
                     "kept on the command line so infrastructure addresses never land in committed configs")
+    ap.add_argument("--init_from", default=None, help="warm start from a model.pt / model_<step>.pt")
+    ap.add_argument("--start_step", type=int, default=None, help="global step of the warm-start checkpoint")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    for k in ("seed", "total_steps", "num_envs", "remote_envs"):
+    for k in ("seed", "total_steps", "num_envs", "remote_envs", "init_from", "start_step"):
         if getattr(a, k) is not None:
             cfg[k] = getattr(a, k)
     out = Path(a.out)

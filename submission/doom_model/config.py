@@ -13,6 +13,7 @@ class ModelConfig:
     embed: int = 512                  # per-step embedding width (Fig. A.1: FC 512 before the GRU)
     use_map: bool = True              # egocentric crops of the ray-built grid map (Neural Map / ANS style)
     use_episodic: bool = False        # attention over past GRU states with relative-pose keys
+    use_pixels: bool = False          # CNN on rgb+depth downsampled to 60x80 (exit signs, switches, key colours)
     episodic_every: int = 4           # write interval (steps)
     episodic_slots: int = 288         # max slots per episode (>= 1050 / 4)
     head: str = "actor_critic"        # "actor_critic" (PPO) or "q" (DRQN, dueling)

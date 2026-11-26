@@ -50,7 +50,7 @@ class DoomAgent:
         if bad or unexpected:
             raise RuntimeError(f"weights do not match config: missing={bad} unexpected={unexpected}")
         self.greedy = self.cfg.head == "q"
-        self.feats = AgentSideFeatures(use_map=self.cfg.use_map)
+        self.feats = AgentSideFeatures(use_map=self.cfg.use_map, use_pixels=self.cfg.use_pixels)
 
     def reset(self) -> None:
         # Reseed per map: a map's action samples never depend on which maps this process played before

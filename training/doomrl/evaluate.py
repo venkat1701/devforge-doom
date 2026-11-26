@@ -41,7 +41,7 @@ METRICS = ("exit", "keys", "doors", "unlocks", "cells", "kills", "dead", "steps"
 
 def run_episode(agent, wad, map_name, seed, ticks):
     from doom_env import make_env
-    env = make_env(wad, map_name, episode_ticks=ticks, render_buffers=False)
+    env = make_env(wad, map_name, episode_ticks=ticks)   # official default: rgb/depth rendered (pixel models)
     obs, _ = env.reset(seed=seed)
     agent.reset()
     p = env.privileged_state()

@@ -39,9 +39,9 @@ def _parse(addr: str):
     return host, int(port)
 
 
-def serve(bind: str, n: int, seed: int, ticks, fast: bool, use_map: bool, reward=None):
+def serve(bind: str, n: int, seed: int, ticks, fast: bool, use_map: bool, reward=None, use_pixels=False):
     from doomrl.envs import ProcEnvs
-    envs = ProcEnvs(n, seed, ticks=ticks, fast=fast, use_map=use_map, reward=reward)
+    envs = ProcEnvs(n, seed, ticks=ticks, fast=fast, use_map=use_map, reward=reward, use_pixels=use_pixels)
     with Listener(_parse(bind), authkey=_authkey()) as listener:
         print(f"[env-server] {n} envs ready, listening on {bind}", flush=True)
         while True:
@@ -107,7 +107,7 @@ class RemoteEnvs:
             pass
 
 
-def make_envs(cfg: dict, n: int, use_map: bool):
+def make_envs(cfg: dict, n: int, use_map: bool, use_pixels: bool = False):
     """Local process pool, or a remote server when cfg['remote_envs'] is set."""
     if cfg.get("remote_envs"):
         envs = RemoteEnvs(cfg["remote_envs"])
@@ -116,7 +116,7 @@ def make_envs(cfg: dict, n: int, use_map: bool):
         return envs
     from doomrl.envs import ProcEnvs
     return ProcEnvs(n, cfg["seed"], ticks=cfg.get("episode_ticks", 2100), fast=cfg.get("fast_env", True),
-                    use_map=use_map, reward=cfg.get("reward"))
+                    use_map=use_map, reward=cfg.get("reward"), use_pixels=use_pixels)
 
 
 def main():
@@ -129,7 +129,7 @@ def main():
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     serve(a.bind, a.n, a.seed, cfg.get("episode_ticks", 2100), cfg.get("fast_env", True),
-          cfg["model"].get("use_map", True), cfg.get("reward"))
+          cfg["model"].get("use_map", True), cfg.get("reward"), cfg["model"].get("use_pixels", False))
 
 
 if __name__ == "__main__":

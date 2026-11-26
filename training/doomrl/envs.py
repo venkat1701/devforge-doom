@@ -38,30 +38,32 @@ PRIV_DIM = 8
 REVISIT_GAP = 30                                    # steps; aux label "visited this cell before"
 
 
-def _make_env(wad, map_name, ticks, fast):
+def _make_env(wad, map_name, ticks, fast, render=False):
+    """render: fill rgb/depth (needed only when the model uses pixels)."""
     if fast:
         try:
             sys.path.insert(0, str(ROOT / "training"))
             from fastenv import make_fast_env
-            return make_fast_env(wad, map_name, episode_ticks=ticks, render_buffers=False)
+            return make_fast_env(wad, map_name, episode_ticks=ticks, render_buffers=render)
         except ImportError:
             pass
     from doom_env import make_env
-    return make_env(wad, map_name, episode_ticks=ticks, render_buffers=False)
+    return make_env(wad, map_name, episode_ticks=ticks, render_buffers=render)
 
 
 class TrainEpisodeRunner:
     """One env slot: samples a map per episode (LRU cache of engine instances), tracks reward state."""
 
     def __init__(self, seed: int, ticks, fast: bool, use_map: bool, reward=None, fixed_map=None,
-                 cache: int = 4):
+                 cache: int = 4, use_pixels: bool = False):
         """ticks: int or list of ints; a tick cap is sampled per episode (hidden maps use 2,100-4,200
         ticks, docs/CONTRACT.md §5, so training must cover decisions beyond 525)."""
         self.rng = np.random.default_rng(seed)
         self.tick_choices = list(ticks) if isinstance(ticks, (list, tuple)) else [int(ticks)]
         self.ticks, self.fast, self.fixed_map = self.tick_choices[0], fast, fixed_map
         self.rw = dict(DEFAULT_REWARD, **(reward or {}))
-        self.feats = AgentSideFeatures(use_map=use_map)
+        self.feats = AgentSideFeatures(use_map=use_map, use_pixels=use_pixels)
+        self.render = use_pixels
         self.cache: dict = {}
         self.cache_size = cache
         self.global_step = 0
@@ -71,7 +73,7 @@ class TrainEpisodeRunner:
             if len(self.cache) >= self.cache_size:
                 old = next(iter(self.cache))
                 self.cache.pop(old).close()
-            self.cache[key] = _make_env(key[0], key[1], key[2], self.fast)
+            self.cache[key] = _make_env(key[0], key[1], key[2], self.fast, self.render)
         else:
             self.cache[key] = self.cache.pop(key)                  # move to most-recent
         return self.cache[key]
@@ -190,13 +192,14 @@ class ProcEnvs:
     """N env slots in subprocesses. 'forkserver' start method: no fork after CUDA initialisation
     (review fix; forking a process that has initialised CUDA is unsafe)."""
 
-    def __init__(self, n, seed, ticks=2100, fast=True, use_map=True, reward=None, fixed_maps=None):
+    def __init__(self, n, seed, ticks=2100, fast=True, use_map=True, reward=None, fixed_maps=None, use_pixels=False):
         ctx = mp.get_context("forkserver")
         self.n = n
         self.conns, self.procs = [], []
         for i in range(n):
             a, b = ctx.Pipe()
             kw = dict(seed=seed * 10_000 + i, ticks=ticks, fast=fast, use_map=use_map, reward=reward,
+                      use_pixels=use_pixels,
                       fixed_map=None if fixed_maps is None else fixed_maps[i])
             p = ctx.Process(target=_worker, args=(b, kw), daemon=True)
             p.start()
