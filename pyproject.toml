@@ -15,6 +15,7 @@ dependencies = [
 dev = ["pytest>=8"]
 train = [
     "numba>=0.68.1",
+    "tensorboard>=2.18",
     "torch==2.15.0",
 ]
 
