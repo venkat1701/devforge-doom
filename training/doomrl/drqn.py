@@ -29,6 +29,7 @@ import torch
 
 from doom_model import AgentNet, ModelConfig
 
+from .remote_envs import make_envs
 from .envs import ProcEnvs, ram_stats, stack_feats
 from .targets import nstep_double_q_target
 
@@ -140,8 +141,7 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
     trained = L - BURN - NSTEP
     # replay ratio: each stored step is trained on ~q["replay_ratio"] times (Arnold: 8)
     update_every = max(1, round(B * trained / (q["replay_ratio"] * N)))
-    envs = ProcEnvs(N, cfg["seed"], ticks=cfg.get("episode_ticks", 2100), fast=cfg.get("fast_env", True),
-                    use_map=mcfg.use_map, reward=cfg.get("reward"))
+    envs = make_envs(cfg, N, mcfg.use_map)      # local process pool or a remote env server
     outs = envs.reset()
     replay = RingSeqReplay(N, q["capacity_steps"], L, L - OVERLAP, mcfg.hidden, stack_feats(outs),
                            q["priority_exponent"], q["is_exponent"], q["max_priority_weight"],

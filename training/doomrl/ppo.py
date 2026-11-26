@@ -25,6 +25,7 @@ from torch.distributions import Categorical
 
 from doom_model import AgentNet, ModelConfig
 
+from .remote_envs import make_envs
 from .envs import PRIV_DIM, ProcEnvs, ram_stats, stack_feats
 from .targets import gae
 
@@ -78,8 +79,7 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
     p = cfg["ppo"]
     opt = torch.optim.Adam(net.parameters(), lr=p["lr"], eps=1e-5)
     N, T = cfg["num_envs"], p["num_steps"]
-    envs = ProcEnvs(N, cfg["seed"], ticks=cfg.get("episode_ticks", 2100), fast=cfg.get("fast_env", True),
-                    use_map=mcfg.use_map, reward=cfg.get("reward"))
+    envs = make_envs(cfg, N, mcfg.use_map)      # local process pool or a remote env server
     outs = envs.reset()
     banks = EpisodicBanks(N, mcfg.episodic_every, mcfg.episodic_slots) if mcfg.use_episodic else None
     h = net.init_state(N, dev)
