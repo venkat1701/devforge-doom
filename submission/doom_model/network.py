@@ -115,6 +115,29 @@ class AgentNet(nn.Module):
     def init_state(self, n: int, device=None) -> torch.Tensor:
         return torch.zeros(1, n, self.cfg.hidden, device=device)
 
+    def _apply(self, fn, *args, **kwargs):
+        # Keep cuDNN GRU weights in one contiguous chunk after .to()/deepcopy/load_state_dict; otherwise
+        # PyTorch re-compacts them on every call ("RNN module weights are not part of single contiguous
+        # chunk of memory" warning seen on the T4 for the DRQN target network).
+        out = super()._apply(fn, *args, **kwargs)
+        self.gru.flatten_parameters()
+        return out
+
+    def load_state_dict(self, *args, **kwargs):
+        res = super().load_state_dict(*args, **kwargs)
+        self.gru.flatten_parameters()
+        return res
+
+    def __deepcopy__(self, memo):
+        import copy as _copy
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            setattr(new, k, _copy.deepcopy(v, memo))
+        new.gru.flatten_parameters()
+        return new
+
     def core(self, x, h, starts):
         """x: (T,B,D); starts: (T,B) 1 where obs t begins a new episode (state reset before step t)."""
         if not bool(starts[1:].any()):

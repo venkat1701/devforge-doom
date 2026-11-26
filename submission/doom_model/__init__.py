@@ -8,6 +8,14 @@ Design and paper references: training/docs/DESIGN.md.
 from .actions import ACTIONS, N_ACTIONS
 from .config import ModelConfig
 from .features import AgentSideFeatures
-from .network import AgentNet
 
 __all__ = ["ACTIONS", "N_ACTIONS", "ModelConfig", "AgentSideFeatures", "AgentNet"]
+
+
+def __getattr__(name):
+    # AgentNet (and torch) load lazily: env worker processes import doom_model.features (numpy only) and
+    # must not pay torch's memory per process (measured ~22 GB RSS over 32 workers when imported eagerly).
+    if name == "AgentNet":
+        from .network import AgentNet
+        return AgentNet
+    raise AttributeError(name)

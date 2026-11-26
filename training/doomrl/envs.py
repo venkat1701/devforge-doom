@@ -229,19 +229,20 @@ def stack_feats(outs, key="f"):
 
 
 def ram_stats(envs: "ProcEnvs") -> dict:
-    """Resident memory of the learner + all env workers (Linux /proc; {} elsewhere). Logged every update so
-    peak RAM of the whole training job is measured, not guessed (review item: 32 workers x engine cache)."""
+    """Memory of the learner + env workers (Linux). Uses PSS (proportional set size: shared pages split
+    among the processes sharing them), so the sum is not inflated by pages shared with the forkserver
+    parent, unlike summing RSS. Logged every update so the job's real footprint is measured."""
     import os
-    def rss(pid):
+    def pss(pid):
         try:
-            with open(f"/proc/{pid}/status") as fh:
+            with open(f"/proc/{pid}/smaps_rollup") as fh:
                 for line in fh:
-                    if line.startswith("VmRSS:"):
+                    if line.startswith("Pss:"):
                         return int(line.split()[1]) * 1024
         except OSError:
             return 0
         return 0
-    if not os.path.exists("/proc/self/status"):
+    if not os.path.exists("/proc/self/smaps_rollup"):
         return {}
-    workers = sum(rss(p.pid) for p in envs.procs)
-    return {"rss_learner_gb": rss(os.getpid()) / 2**30, "rss_workers_gb": workers / 2**30}
+    return {"pss_learner_gb": pss(os.getpid()) / 2**30,
+            "pss_workers_gb": sum(pss(p.pid) for p in envs.procs) / 2**30}
