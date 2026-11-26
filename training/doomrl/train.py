@@ -52,10 +52,12 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--total_steps", type=int, default=None, help="override (smoke tests)")
     ap.add_argument("--num_envs", type=int, default=None, help="override (smoke tests)")
+    ap.add_argument("--remote_envs", default=None, help="ip:port of an env server (doomrl.remote_envs); "
+                    "kept on the command line so infrastructure addresses never land in committed configs")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    for k in ("seed", "total_steps", "num_envs"):
+    for k in ("seed", "total_steps", "num_envs", "remote_envs"):
         if getattr(a, k) is not None:
             cfg[k] = getattr(a, k)
     out = Path(a.out)
