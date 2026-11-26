@@ -1,0 +1,42 @@
+{
+  "_about": "DRQN candidate: R2D2-style learner (Acme) with Arnold acting/replay settings; same encoder + map.",
+  "algo": "drqn",
+  "seed": 0,
+  "total_steps": 20000000,
+  "num_envs": 32,
+  "episode_ticks": [
+    2100,
+    4200
+  ],
+  "fast_env": true,
+  "model": {
+    "hidden": 512,
+    "embed": 512,
+    "use_map": true,
+    "use_episodic": false,
+    "aux": false
+  },
+  "_drqn_source": "Acme r2d2 config.py: burn_in 40, trace 80, period 40, n 5, target 2500, IS 0.6, priority exp 0.9, max_priority_weight 0.9; Arnold: replay 1M, gamma 0.99, sampled ~8x, eps 1->0.1 over 1M; grad clip 10 (DRQN App. C: LSTM gradients clipped to ten); lr 1e-4 (Acme default is 1e-3; R2D2 paper unverified)",
+  "drqn": {
+    "seq_len": 80,
+    "burn_in": 40,
+    "overlap": 40,
+    "n_step": 5,
+    "batch_seqs": 32,
+    "replay_ratio": 8,
+    "capacity_steps": 1000000,
+    "learn_start": 50000,
+    "gamma": 0.99,
+    "rescale": true,
+    "lr": 0.0001,
+    "adam_eps": 0.001,
+    "target_update": 2500,
+    "priority_exponent": 0.9,
+    "is_exponent": 0.6,
+    "max_priority_weight": 0.9,
+    "epsilon": "arnold",
+    "max_grad_norm": 10.0
+  },
+  "save_every_steps": 250000,
+  "_episode_ticks_source": "docs/CONTRACT.md \u00a75: episode cap 2,100-4,200 ticks depending on the map; sampled per episode"
+}

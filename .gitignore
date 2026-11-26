@@ -222,3 +222,8 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# Training outputs (checkpoints, logs) stay out of git; submission weights go in submission/weights via LFS
+training/runs/
+# Test-suite usage log must be committed so any reuse of the held-out maps is visible (overrides *.log)
+!training/docs/TEST_SUITE_USAGE.log

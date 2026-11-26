@@ -13,6 +13,9 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8"]
+train = [
+    "numba>=0.68.1",
+]
 
 [tool.uv.sources]
 doom-env = { path = "env", editable = true }
