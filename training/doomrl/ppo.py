@@ -208,7 +208,7 @@ def train(cfg: dict, out_dir: Path, log) -> AgentNet:
                 nn.utils.clip_grad_norm_(net.parameters(), p["max_grad_norm"]); opt.step()
         updates += 1
         log.update(steps, {"pg": pg.item(), "vloss": vloss.item(), "entropy": ent.item(), "critic_warmup": float(in_warmup),
-                           "lr": opt.param_groups[0]["lr"], "sps": steps / (time.time() - t0), **ram_stats(envs)})
+                           "lr": opt.param_groups[0]["lr"], "sps": (steps - start_step) / (time.time() - t0), **ram_stats(envs)})
         if updates % cfg.get("save_every_updates", 50) == 0 or updates == n_updates:
             save(net, mcfg, out_dir, steps)
     envs.close()
