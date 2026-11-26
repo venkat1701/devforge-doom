@@ -33,8 +33,10 @@
     "clip_vloss": true,
     "ent_coef": 0.01,
     "vf_coef": 0.5,
-    "max_grad_norm": 0.5
+    "max_grad_norm": 0.5,
+    "critic_warmup_updates": 10
   },
   "save_every_updates": 100,
-  "_episode_ticks_source": "docs/CONTRACT.md \u00a75: episode cap 2,100-4,200 ticks depending on the map; sampled per episode"
+  "_episode_ticks_source": "docs/CONTRACT.md \u00a75: episode cap 2,100-4,200 ticks depending on the map; sampled per episode",
+  "_warmup_note": "critic_warmup_updates applies only with --init_from (warm start): critic-only updates first, policy frozen"
 }
