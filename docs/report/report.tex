@@ -1,0 +1,151 @@
+\documentclass{article}
+\usepackage{iclr2025_conference,times}
+\usepackage{newtxmath}\usepackage{fontspec}\setmainfont{texgyretermes}[Extension=.otf,UprightFont=*-regular,BoldFont=*-bold,ItalicFont=*-italic,BoldItalicFont=*-bolditalic]\setmonofont{texgyrecursor}[Extension=.otf,UprightFont=*-regular,BoldFont=*-bold,ItalicFont=*-italic,BoldItalicFont=*-bolditalic]
+\input{math_commands.tex}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url,graphicx,booktabs,tabularx,xcolor,subcaption,tikz,float}
+\usetikzlibrary{positioning,arrows.meta,calc}
+\iclrfinalcopy
+
+\definecolor{cV7}{HTML}{6A4CE2}\definecolor{soft}{HTML}{F3F1FB}\definecolor{line}{HTML}{8A8A8A}
+
+\renewcommand{\topfraction}{0.9}\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.08}\renewcommand{\floatpagefraction}{0.85}
+\setcounter{topnumber}{4}\setcounter{bottomnumber}{3}\setcounter{totalnumber}{6}
+\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
+\setlength{\floatsep}{5pt plus 2pt minus 2pt}
+\setlength{\intextsep}{5pt plus 2pt minus 2pt}
+\captionsetup{font=small,labelfont=bf,skip=2pt}
+\captionsetup[sub]{font=footnotesize,skip=1pt}
+\setlength{\bibsep}{1pt plus 0.5pt}
+
+\title{Finishing Unseen DOOM Maps\\From Egocentric Sensors}
+\author{Krish Jaiswal, Iyad Farooq, B Abhiruchi \& Neha Sharma \\ Team Kasukabe}
+
+\begin{document}
+\maketitle
+\lhead{DevForge 2026, Track 1: Can It Play DOOM?}
+
+\vspace{-18pt}
+\begin{figure}[h]
+\centering
+\begin{subfigure}[t]{0.243\linewidth}\includegraphics[width=\linewidth]{figs/f_403.png}\caption{Tier 3, exploring}\end{subfigure}\hfill
+\begin{subfigure}[t]{0.243\linewidth}\includegraphics[width=\linewidth]{figs/f_619.png}\caption{Tier 3, fighting}\end{subfigure}\hfill
+\begin{subfigure}[t]{0.243\linewidth}\includegraphics[width=\linewidth]{figs/f_883.png}\caption{Tier 4, firefight}\end{subfigure}\hfill
+\begin{subfigure}[t]{0.243\linewidth}\includegraphics[width=\linewidth]{figs/f_931.png}\caption{Tier 4, near the exit}\end{subfigure}
+\caption{The submitted agent on two held-out maps it never trained on, with one and two locked doors. Both episodes end at the exit.}
+\label{fig:frames}
+\end{figure}
+\vspace{-10pt}
+
+\section{Introduction}
+The task is to play DOOM on hidden maps in four tiers (combat, doors, keycards and a gauntlet), scored on exits, doors, exploration and combat, with 40\,ms per decision on one CPU thread. Our recurrent PPO policy \citep{schulman2017ppo} trains in ViZDoom \citep{kempka2016vizdoom}, and three decisions did most of the work. We generated our own maps, because Freedoom levels are too long to finish within the 2,100 to 4,200 tick budget. We gave the reward one term per scoring category plus a potential-based guide to the next objective \citep{ng1999pbrs}. And once we saw that half of all trigger presses had no enemy in view, we penalised them. The submitted agent finishes 84\% of held-out maps and 83\% of a reserved test set run once.
+
+\section{Method}
+\begin{figure}[!b]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[font=\footnotesize,
+  enc/.style={draw=line, rounded corners=1.5pt, fill=soft, inner sep=2.2pt, align=left, text width=7.0cm, minimum height=4.6mm},
+  box/.style={draw=line, rounded corners=1.5pt, fill=white, inner sep=2.5pt, align=center},
+  arr/.style={-{Latex[length=1.5mm]}, draw=line, line width=0.5pt}]
+\node[enc] (r) {\textbf{Rays} $64\times7$ $\rightarrow$ circular Conv1d $\times3$ $\rightarrow$ 256};
+\node[enc, below=0.9mm of r] (e) {\textbf{Entities} $\le32$ $\rightarrow$ shared MLP, pooled $\rightarrow$ 128};
+\node[enc, below=0.9mm of e] (v) {\textbf{Vitals} 17 + last action $\rightarrow$ MLP $\rightarrow$ 64};
+\node[enc, below=0.9mm of v] (p) {\textbf{RGB-D} $4\times60\times80$ $\rightarrow$ Nature CNN (added)};
+\coordinate (mid) at ($(e.south)!0.5!(v.north)$);
+\node[box, minimum height=21mm, minimum width=12mm] (f) at ($(mid)+(4.55,0)$) {Concat\\448\\[2pt]FC 512\\[2pt]+ pixels};
+\node[box, minimum height=21mm, minimum width=14mm, fill=cV7!12, draw=cV7, right=4mm of f] (g) {\textbf{GRU}\\\textbf{512}\\[2pt]episode\\memory};
+\node[box, right=5mm of g, yshift=5mm, minimum width=27mm] (pi) {Policy: 56 combinations};
+\node[box, right=5mm of g, yshift=-5mm, minimum width=27mm, dashed] (val) {Value (training only)};
+\node[box, right=4mm of pi, fill=soft] (a) {Mask SELECT, $T{=}0.25$};
+\foreach \n in {r,e,v,p} \draw[arr] (\n.east) -- (f.west |- \n.east);
+\draw[arr] (f) -- (g); \draw[arr] (g.east) -- ++(2mm,0) |- (pi.west); \draw[arr] (g.east) -- ++(2mm,0) |- (val.west); \draw[arr] (pi) -- (a);
+\end{tikzpicture}}
+\caption{Policy network. All inputs come from the official observation; 2.64M parameters, 1.1\,ms median and 1.4\,ms p99 per decision on one pinned CPU core.}
+\label{fig:arch}
+\end{figure}
+
+
+\paragraph{Network (Figure~\ref{fig:arch}).} Rays wrap around the agent, so a circular convolution treats the ray behind it as a neighbour of the ray in front. Objects come in any number and order, so a shared MLP embeds each and we pool, which keeps the encoder order-invariant \citep{zaheer2017deepsets}. With no position input, a 512-unit GRU \citep{cho2014gru} carries an episode-long state; this is how the agent returns to a locked door after finding its key. The pixel branch is the Nature CNN \citep{mnih2015dqn} behind a zero-initialised projection, so adding it did not disturb a trained policy.
+
+\paragraph{Curriculum.} Our generator writes small UDMF maps in the four tiers using the template map's door and exit conventions, and we check each one in the real engine. We train on 240 generated maps, 41 Freedoom levels and 5 ViZDoom scenarios, select checkpoints on 24 held-out maps plus the template, and keep 24 more maps and Freedoom MAP25 to MAP32 for one final test \citep{cobbe2020procgen}.
+
+\paragraph{Reward.} The official reward pays only for exits, deaths and kills, which is too sparse on maps that take thousands of ticks. We add a term for each scoring category, a route potential $\Phi=-d/2000$ with $d$ the remaining path through any missing keys to the exit, and from v7 a penalty for firing with no enemy within $\pm8^\circ$. The route term is a potential because shaping of the form $\Phi(s')-\Phi(s)$ leaves the optimal policy unchanged \citep{ng1999pbrs}. Appendix~\ref{app:reward} lists every weight and the reason for it.
+
+\paragraph{Learning.} We use synchronous recurrent PPO in the style of CleanRL \citep{huang2022cleanrl} (clip 0.1, GAE $\lambda=0.95$ \citep{schulman2016gae}, $\gamma=0.99$, 128-step rollouts, 4 epochs, Adam at $2.5\times10^{-4}$), because it resumes exactly and is easy to audit, which mattered more under a deadline than raw speed. Each stage warm-starts from the previous best checkpoint. Building engines in a background thread and adding simulators took throughput from 1.3k to 6.0k transitions per second (Figure~\ref{fig:results}c).
+
+\paragraph{Inference.} The network picks every action under two fixed settings. Masking the one combination that presses only SELECT\_NEXT\_WEAPON cut time on fists while holding bullets from 41\% to 7\%, since the engine already switches weapons on pickup and when one runs dry. Sampling at temperature 0.25 halved the back-and-forth loops of greedy play and raised our proxy from 17.08 to 17.51 on the same 300 episodes.
+
+\section{Experiments}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{figs/fig_lineage.pdf}
+\caption{Held-out results along the training lineage, 100 episodes per point. Rings mark the submitted checkpoint's 800-episode check. Panel (c) counts trigger presses with no enemy anywhere in the $90^\circ$ field of view.}
+\label{fig:lineage}
+\end{figure}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{figs/fig_results.pdf}
+\caption{(a) Exit rate per tier: v4 (300 episodes), submitted v7 (800), v7 on reserved test maps (288, run once). (b) Rounds fired with no enemy within $\pm8^\circ$ during training. (c) Median training throughput in thousand transitions per second.}
+\label{fig:results}
+\end{figure}
+
+
+Checkpoints are played by the real submission agent on the 25 held-out maps with 2 seeds and both tick caps (100 episodes; finalists get 800) and ranked by a proxy of the scoring categories (Appendix~\ref{app:results}), which is our estimate and not the official score.
+
+\paragraph{What helped.} Generated maps gave the largest jump, from 0.27 to 0.47 exits in 6M steps. The route potential took exits from 0.70 to 0.85 and improved every tier but the gauntlet, since the agent now felt its distance to the next missing key. The trigger penalties gave the cleanest gain: firing at nothing fell from 52\% to 7\% of presses and ammunition from 38.6 to 16.0 rounds per episode, while exits, locked doors and deaths all improved (Table~\ref{tab:results}).
+
+\paragraph{What did not.} An IMPALA encoder \citep{espeholt2018impala} learned trigger discipline faster (Figure~\ref{fig:results}b) but ended level with the Nature CNN, so we kept the smaller one. Slot memory with behaviour cloning and RND \citep{burda2019rnd} matched the plain GRU at equal steps (proxy 15.3 against 14.6) at a third of its speed, so we stopped it. Full Freedoom levels stay unsolved (no exits; deaths in half the reserved episodes), as do many gauntlets (0.46 exits). Our next step is a learned egocentric occupancy map as spatial memory.
+
+{\small
+\bibliography{refs}
+\bibliographystyle{iclr2025_conference}}
+
+\appendix
+\section{Training reward}\label{app:reward}
+\begin{table}[H]
+\centering\footnotesize
+\caption{Training reward on top of the official +1 exit, $-1$ death and +0.1 kill. Each term was added in its own stage and kept only if held-out results improved. Terms may read privileged state, which the policy never sees.}
+\label{tab:reward}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Term & Weight & Why \\
+\midrule
+Exit (+ health, time left) & 2 (+.25, +.25) & Largest scoring item; finishing healthy and early earns more. \\
+Key / door / locked door & .5 / .1 / 1.0 & Progression is scored; locked doors gate tier 3. \\
+New $128^2$ cell (once) & .025 & Exploration is scored. \\
+Extra kill / damage per HP & .05 / $-$.002 & Combat is scored as kills minus damage. \\
+Route potential $\Phi=-d/2000$ & $\Phi(s')-\Phi(s)$ & $d$: path left through missing keys to the exit. Keeps the optimal policy. \\
+Press / round, no enemy in $\pm8^\circ$ & $-$.01 / $-$.05 & Half of all presses saw no enemy; $8^\circ\approx$ one turn step. \\
+Fists with ammo / step & $-$.005 / $-$.001 & Agent drifted to fists; step cost curbs wandering. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Full results}\label{app:results}
+
+\begin{table}[H]
+\centering\footnotesize
+\caption{Held-out results. ``Blind'' is the share of trigger presses with no enemy anywhere in the $90^\circ$ field of view and ``Rounds'' is ammunition spent per episode. Proxy is $10\,\text{exit}(1+0.1\,\text{health}/100)+2\,\text{keys}+\text{doors}+2\,\text{locked}+0.1\,\text{cells}+0.5\,\text{kills}-0.01\,\text{damage}-\text{death}$, averaged over episodes. The 100-episode rows use greedy play. The v4 row adds the action mask, and every later row also samples at $T=0.25$. Keys, locked doors and deaths are per-episode averages.}
+\label{tab:results}
+\setlength{\tabcolsep}{3.1pt}
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+Checkpoint (steps; episodes) & Exit & Keys & Locked & Deaths & Blind & Rounds & Proxy \\
+\midrule
+Official reward only (3.7M; 100) & .03 & .26 & .00 & .11 & -- & -- & 2.37 \\
++ shaping on Freedoom (10.6M; 100) & .27 & .67 & .04 & .09 & -- & -- & 8.45 \\
++ generated maps, 256 sims (36.9M; 100) & .70 & .78 & .69 & .09 & .54 & 24.3 & 16.11 \\
++ route potential, mask (51.6M; 300) & .81 & .80 & .72 & .10 & .52 & 38.6 & 17.18 \\
+\textbf{+ trigger penalties, submitted (67.2M; 800)} & \textbf{.84} & .80 & \textbf{.74} & .04 & \textbf{.07} & 16.0 & \textbf{17.60} \\
+IMPALA encoder, same reward (47.9M; 800) & .83 & .81 & .72 & .03 & .14 & 15.4 & 17.31 \\
+\midrule
+Submitted, reserved generated maps (288) & .83 & .77 & .74 & .05 & .08 & 18.2 & 16.94 \\
+Submitted, reserved Freedoom levels (96) & .00 & .00 & .00 & .54 & .00 & 10.1 & 1.54 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\end{document}
