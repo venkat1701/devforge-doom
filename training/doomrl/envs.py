@@ -1,229 +1,289 @@
-"""Training environments: map sampling, agent-side features, shaped reward, privileged critic inputs,
-auxiliary labels, and a spawn-safe process pool.
-
-Everything the network sees comes from AgentSideFeatures (submission/doom_model/features.py), the same
-code the evaluated agent runs. Privileged state (env.privileged_state(), training only, docs/CONTRACT.md
-§7) is used only for: the shaped reward, the critic's extra inputs, and auxiliary-head labels.
-
-Shaped reward, aligned with the official scoring categories (docs/EVALUATION.md "Scoring": exit is the
-largest; progression; exploration; combat and survival). Review fixes: doors and unlocks are rewarded,
-and exploration is capped so it can never outweigh reaching the exit.
-"""
-
+"""Uniform train-map environments: official wrapper reward, optionally plus training-only progress shaping."""
 from __future__ import annotations
 
 import multiprocessing as mp
-import sys
+import os
+import threading
 from pathlib import Path
+import sys
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT / "submission") not in sys.path:
-    sys.path.insert(0, str(ROOT / "submission"))
+sys.path.insert(0, str(ROOT / "submission"))
+from doom_model.features import AgentSideFeatures
+from doom_model.actions import ACTIONS
+from .maps import resolve_training_maps, sample_map
+from .progress import EpisodeProgress, RouteGuide, enemy_in_view, resolve_shaping, total_ammo
+from .maps import gen_layout
 
-from doom_model.features import AgentSideFeatures  # noqa: E402
-
-from .maps import sample_map  # noqa: E402
-
-CELL = 64.0
-PLAYER_HEIGHT = 56.0
-DEFAULT_REWARD = dict(
-    exit=10.0, exit_health=2.0, exit_time=2.0,      # exit + efficiency bonus (health, time left)
-    key=2.0, door=0.5, unlock=3.0,                  # progression
-    cell=0.02, cell_cap=4.0,                        # exploration, capped per episode (< exit)
-    kill=0.5, hp_loss=0.002, death=2.0,             # combat & survival
-)
-PRIV_DIM = 8
-REVISIT_GAP = 30                                    # steps; aux label "visited this cell before"
+PRIV_DIM = 7  # direct state only: time fraction, health, kills, items, damage, keys, terminal exit
 
 
 def _make_env(wad, map_name, ticks, fast, render=False):
-    """render: fill rgb/depth (needed only when the model uses pixels)."""
     if fast:
-        try:
-            sys.path.insert(0, str(ROOT / "training"))
-            from fastenv import make_fast_env
-            return make_fast_env(wad, map_name, episode_ticks=ticks, render_buffers=render)
-        except ImportError:
-            pass
+        from fastenv import make_fast_env
+        return make_fast_env(wad, map_name, episode_ticks=ticks, render_buffers=render)
     from doom_env import make_env
     return make_env(wad, map_name, episode_ticks=ticks, render_buffers=render)
 
 
-class TrainEpisodeRunner:
-    """One env slot: samples a map per episode (LRU cache of engine instances), tracks reward state."""
+def privileged_vector(p):
+    return np.asarray([p["tic"] / p["episode_ticks"], p["health"] / 100.,
+                       p["kills"], p["items"], p["damage_taken"] / 100.,
+                       np.sum(p["keys"]), float(p["exit_reached"])], dtype=np.float32)
 
-    def __init__(self, seed: int, ticks, fast: bool, use_map: bool, reward=None, fixed_map=None,
-                 cache: int = 4, use_pixels: bool = False):
-        """ticks: int or list of ints; a tick cap is sampled per episode (hidden maps use 2,100-4,200
-        ticks, docs/CONTRACT.md §5, so training must cover decisions beyond 525)."""
+
+class TrainEpisodeRunner:
+    def __init__(self, seed, ticks, fast, use_map=False, reward=None, fixed_map=None,
+                 cache=4, use_pixels=True, training_maps=None, prefetch=False):
+        self.shaping = resolve_shaping(reward)  # None = official wrapper reward only
+        self.maps = resolve_training_maps(training_maps)
+        if fixed_map is not None and tuple(fixed_map) not in self.maps:
+            raise ValueError("fixed map must belong to the training manifest")
         self.rng = np.random.default_rng(seed)
-        self.tick_choices = list(ticks) if isinstance(ticks, (list, tuple)) else [int(ticks)]
-        self.ticks, self.fast, self.fixed_map = self.tick_choices[0], fast, fixed_map
-        self.rw = dict(DEFAULT_REWARD, **(reward or {}))
-        self.feats = AgentSideFeatures(use_map=use_map, use_pixels=use_pixels)
-        self.render = use_pixels
-        self.cache: dict = {}
-        self.cache_size = cache
+        self.tick_choices = list(ticks) if isinstance(ticks, (list, tuple)) else [ticks]
+        if not self.tick_choices or any(type(t) is not int or t <= 0 for t in self.tick_choices):
+            raise ValueError("episode tick caps must be positive integers")
+        if cache <= 0:
+            raise ValueError("cache must be positive")
+        self.fast, self.fixed_map = fast, fixed_map
+        self.feats = AgentSideFeatures(use_map, use_pixels)
+        self.render, self.cache_size = use_pixels, cache
+        self.cache = {}
         self.global_step = 0
+        # prefetch: draw the NEXT episode's (map, cap) at reset and build its engine in a background
+        # thread, so a cold engine start (~150 ms) no longer stalls the synchronous batch. Same
+        # uniform distribution; only the order of RNG draws differs from prefetch=False.
+        self.prefetch, self._next = prefetch, None
 
     def _env(self, key):
         if key not in self.cache:
             if len(self.cache) >= self.cache_size:
-                old = next(iter(self.cache))
-                self.cache.pop(old).close()
-            self.cache[key] = _make_env(key[0], key[1], key[2], self.fast, self.render)
+                self.cache.pop(next(iter(self.cache))).close()
+            self.cache[key] = _make_env(*key, self.fast, self.render)
         else:
-            self.cache[key] = self.cache.pop(key)                  # move to most-recent
+            self.cache[key] = self.cache.pop(key)
         return self.cache[key]
 
+    def _draw_key(self):
+        m = self.fixed_map or sample_map(self.rng, maps=self.maps)
+        return (*m, int(self.rng.choice(self.tick_choices)))
+
+    def _schedule_next(self):
+        key, box = self._draw_key(), {}
+        thread = None
+        if key not in self.cache:
+            def build():
+                try:
+                    box["env"] = _make_env(*key, self.fast, self.render)
+                except BaseException as error:  # surfaced on the next reset
+                    box["error"] = error
+            thread = threading.Thread(target=build, name="doom-prefetch", daemon=True)
+            thread.start()
+        self._next = (key, thread, box)
+
+    def _take_next(self):
+        key, thread, box = self._next
+        self._next = None
+        if thread is not None:
+            thread.join()
+        if "error" in box:
+            raise RuntimeError(f"prefetched engine failed: {box['error']}") from box["error"]
+        if "env" in box:
+            if key in self.cache:
+                box["env"].close()
+            else:
+                if len(self.cache) >= self.cache_size:
+                    self.cache.pop(next(iter(self.cache))).close()
+                self.cache[key] = box["env"]
+        return key
+
     def reset(self, seed=None):
-        wad_map = self.fixed_map or sample_map(self.rng, self.global_step)
-        self.ticks = int(self.rng.choice(self.tick_choices))
-        self.map = wad_map
-        self.env = self._env((wad_map[0], wad_map[1], self.ticks))
+        key = self._take_next() if self._next is not None else self._draw_key()
+        self.map, self.ticks = tuple(key[:-1]), key[-1]
+        self.env = self._env(key)
         obs, _ = self.env.reset(seed=int(self.rng.integers(1 << 30)) if seed is None else seed)
+        if self.prefetch:
+            self._schedule_next()
         p = self.env.privileged_state()
-        lock = p["door_lock"]
-        gap = p["sector_ceiling"] - p["sector_floor"]
-        self.s = {
-            "x0": p["x"], "y0": p["y"], "cells": {}, "cell_r": 0.0,
-            "kills": p["kills"], "kills0": p["kills"], "health": p["health"], "keys": 0.0,
-            "door_ids": np.flatnonzero(lock == 0), "lock_ids": np.flatnonzero(lock > 0),
-            "opened": set(np.flatnonzero((lock >= 0) & (gap >= PLAYER_HEIGHT)).tolist()),  # open at spawn
-            "doors": 0, "unlocks": 0, "t": 0, "ret": 0.0, "exit": False, "dead": False,
-        }
-        self._visit(p)
-        f = self.feats.reset(obs)
-        return self._pack(f, p, 0.0, False, False)
+        self.steps, self.ret = 0, 0.
+        self.kills0 = p["kills"]
+        self.native_ret = 0.
+        self.progress = EpisodeProgress(p) if self.shaping else None
+        layout = gen_layout(self.map[0], self.map[1]) if self.shaping and self.shaping.get("route") else None
+        self.route = RouteGuide(layout) if layout else None
+        self.phi = self.route.potential(p) if self.route else 0.0
+        self._obs = obs
+        return self._pack(self.feats.reset(obs), p, 0., False, False)
 
-    def _visit(self, p):
-        c = (int(p["x"] // CELL), int(p["y"] // CELL))
-        s = self.s
-        rev = c in s["cells"] and s["t"] - s["cells"][c] >= REVISIT_GAP
-        new = c not in s["cells"]
-        s["cells"].setdefault(c, s["t"])
-        return new, rev
-
-    def step(self, a: int):
-        obs, _, term, trunc, info = self.env.step(self._buttons(a))
+    def step(self, a):
+        if not 0 <= a < len(ACTIONS):
+            raise ValueError("action outside vocabulary")
+        acted_on = self._obs
+        obs, reward, term, trunc, _ = self.env.step(ACTIONS[a])
+        self._obs = obs
         p = self.env.privileged_state()
-        s, rw = self.s, self.rw
-        s["t"] += 1
-        r = 0.0
-        new, _ = self._visit(p)
-        if new and s["cell_r"] < rw["cell_cap"]:
-            inc = min(rw["cell"], rw["cell_cap"] - s["cell_r"])
-            r += inc; s["cell_r"] += inc
-        r += rw["kill"] * (p["kills"] - s["kills"]); s["kills"] = p["kills"]
-        keys = float(np.sum(p["keys"]))
-        r += rw["key"] * (keys - s["keys"]); s["keys"] = keys
-        gap = p["sector_ceiling"] - p["sector_floor"]
-        for sid in s["door_ids"]:
-            if sid not in s["opened"] and gap[sid] >= PLAYER_HEIGHT:
-                s["opened"].add(sid); s["doors"] += 1; r += rw["door"]
-        for sid in s["lock_ids"]:
-            if sid not in s["opened"] and gap[sid] >= PLAYER_HEIGHT:
-                s["opened"].add(sid); s["unlocks"] += 1; r += rw["unlock"]
-        lost = max(0.0, s["health"] - p["health"]); s["health"] = p["health"]
-        r -= rw["hp_loss"] * lost
-        if info["exit_reached"]:
-            s["exit"] = True
-            r += rw["exit"] + rw["exit_health"] * max(0.0, p["health"]) / 100.0 \
-                + rw["exit_time"] * (1.0 - p["tic"] / p["episode_ticks"])
-        if p["dead"]:
-            s["dead"] = True; r -= rw["death"]
-        s["ret"] += r
-        done = term or trunc
-        f = None if done else self.feats.step(a, obs)
-        return self._pack(f, p, r, done, bool(term))
+        self.steps += 1
+        self.native_ret += float(reward)
+        if self.progress is not None:
+            reward = float(reward) + self.progress.bonus(self.progress.update(p), self.shaping)
+            if self.route is not None:
+                phi = self.route.potential(p)
+                shaped = self.shaping["route"] * (phi - self.phi)
+                self.phi = phi
+                self.progress.components["route"] += shaped
+                reward += shaped
+            if not (term or trunc):  # the wrapper repeats the last observation at episode end
+                seen = enemy_in_view(acted_on, self.shaping.get("aim_cone_deg"))
+                reward += self.progress.fired(total_ammo(acted_on) - total_ammo(obs), seen, self.shaping)
+                reward += self.progress.pressed(bool(ACTIONS[a][6]), seen, self.shaping)
+                reward += self.progress.tick(acted_on, self.shaping)
+        self.ret += float(reward)
+        f = None if term or trunc else self.feats.step(a, obs)
+        return self._pack(f, p, float(reward), bool(term), bool(trunc))
 
-    @staticmethod
-    def _buttons(a):
-        from doom_model.actions import ACTIONS
-        return ACTIONS[a]
-
-    def _pack(self, f, p, r, done, term):
-        s = self.s
-        x, y, th = p["x"], p["y"], np.radians(p["angle"])
-        dx, dy = s["x0"] - x, s["y0"] - y
-        home = np.array([dx * np.cos(th) + dy * np.sin(th), dx * np.sin(th) - dy * np.cos(th)], np.float32) / 1024
-        c = (int(x // CELL), int(y // CELL))
-        revisit = float(c in s["cells"] and s["t"] - s["cells"][c] >= REVISIT_GAP)
-        priv = np.array([s["t"] * 4 / self.ticks, len(s["cells"]) / 200, (s["kills"] - s["kills0"]) / 10,
-                         s["keys"] / 3, max(0.0, p["health"]) / 100, s["doors"] / 10, s["unlocks"] / 3,
-                         float(s["exit"])], np.float32)
-        out = {"f": f, "r": r, "done": done, "term": term, "priv": priv,
-               "aux": np.array([revisit, *home], np.float32)}
-        if done:
-            out["episode"] = {"map": f"{Path(self.map[0]).stem}:{self.map[1]}", "ticks": self.ticks, "steps": s["t"],
-                              "cells": len(s["cells"]), "kills": s["kills"] - s["kills0"], "keys": s["keys"],
-                              "doors": s["doors"], "unlocks": s["unlocks"], "exit": s["exit"],
-                              "dead": s["dead"], "return": s["ret"]}
+    def _pack(self, f, p, reward, term, trunc):
+        out = {"f": f, "priv": privileged_vector(p), "r": reward,
+               "done": term or trunc, "term": term, "trunc": trunc,
+               "map": f"{Path(self.map[0]).name}:{self.map[1]}"}
+        if out["done"]:
+            out["episode"] = {
+                "map": out["map"], "ticks": self.ticks, "steps": self.steps,
+                "return": self.ret, "kills": p["kills"] - self.kills0,
+                "keys": float(np.sum(p["keys"])), "items": p["items"], "health": p["health"],
+                "damage_taken": p["damage_taken"], "exit": bool(p["exit_reached"]),
+                "dead": bool(p["dead"]), "timeout": bool(p["timeout"]),
+                "native_return": self.native_ret,
+            }
+            if self.progress is not None:
+                s = self.progress.summary()
+                out["episode"].update({k: s[k] for k in ("cells", "doors_opened", "locked_opened", "keys_picked",
+                                                         "distance", "revisit_ratio", "shaping", "damage",
+                                                         "ammo_spent", "blind_ammo")})
         return out
+
+    def close(self):
+        if self._next is not None:
+            _, thread, box = self._next
+            self._next = None
+            if thread is not None:
+                thread.join()
+            if "env" in box:
+                box["env"].close()
+        for env in self.cache.values():
+            env.close()
+        self.cache.clear()
+
+
+def worker_kwargs(n, seed, ticks, fast, use_map, reward, use_pixels, training_maps, fixed_maps):
+    """Per-worker runner arguments; next-episode engine prefetch is on for every pool worker."""
+    return [dict(seed=seed * 10_000 + i, ticks=ticks, fast=fast, use_map=use_map,
+                 reward=reward, use_pixels=use_pixels, training_maps=training_maps,
+                 fixed_map=None if fixed_maps is None else fixed_maps[i],
+                 prefetch=True) for i in range(n)]
 
 
 def _worker(conn, kw):
-    runner = TrainEpisodeRunner(**kw)
-    while True:
-        cmd, data = conn.recv()
-        if cmd == "step":
-            out = runner.step(data)
-            if out["done"]:
-                ep = out["episode"]
-                nxt = runner.reset()
-                nxt.update(r=out["r"], done=True, term=out["term"], episode=ep,
-                           aux_last=out["aux"], priv_last=out["priv"])
-                out = nxt
-            conn.send(out)
-        elif cmd == "reset":
-            conn.send(runner.reset(seed=data))
-        elif cmd == "set_step":
-            runner.global_step = data
-        elif cmd == "close":
-            for e in runner.cache.values():
-                e.close()
-            conn.close()
-            return
+    runner = None
+    try:
+        runner = TrainEpisodeRunner(**kw)
+        while True:
+            cmd, data = conn.recv()
+            if cmd == "close":
+                break
+            if cmd == "step":
+                out = runner.step(data)
+                if out["done"]:
+                    terminal = out
+                    out = runner.reset()
+                    out.update({k: terminal[k] for k in ("r", "done", "term", "trunc", "episode")})
+                    out["transition_map"] = terminal["map"]
+                conn.send(out)
+            elif cmd == "reset":
+                conn.send(runner.reset(seed=data))
+            elif cmd == "set_step":
+                runner.global_step = data
+                conn.send(None)
+            else:
+                raise ValueError(f"unknown environment command {cmd}")
+    except EOFError:
+        pass
+    except Exception as error:
+        try:
+            conn.send({"worker_error": f"{type(error).__name__}: {error}"})
+        except (OSError, EOFError):
+            pass
+    finally:
+        if runner is not None:
+            runner.close()
+        conn.close()
 
 
 class ProcEnvs:
-    """N env slots in subprocesses. 'forkserver' start method: no fork after CUDA initialisation
-    (review fix; forking a process that has initialised CUDA is unsafe)."""
-
-    def __init__(self, n, seed, ticks=2100, fast=True, use_map=True, reward=None, fixed_maps=None, use_pixels=False):
-        ctx = mp.get_context("forkserver")
-        self.n = n
+    def __init__(self, n, seed, ticks=2100, fast=False, use_map=False, reward=None,
+                 fixed_maps=None, use_pixels=True, training_maps=None, timeout=120.):
+        if type(n) is not int or n <= 0 or timeout <= 0:
+            raise ValueError("worker count and timeout must be positive")
+        if fixed_maps is not None and len(fixed_maps) != n:
+            raise ValueError("one fixed map is required per worker")
+        maps = resolve_training_maps(training_maps)
+        self.n, self.timeout, self.closed = n, timeout, False
         self.conns, self.procs = [], []
-        for i in range(n):
-            a, b = ctx.Pipe()
-            kw = dict(seed=seed * 10_000 + i, ticks=ticks, fast=fast, use_map=use_map, reward=reward,
-                      use_pixels=use_pixels,
-                      fixed_map=None if fixed_maps is None else fixed_maps[i])
-            p = ctx.Process(target=_worker, args=(b, kw), daemon=True)
-            p.start()
-            self.conns.append(a); self.procs.append(p)
+        ctx = mp.get_context("forkserver")
+        try:
+            for kw in worker_kwargs(n, seed, ticks, fast, use_map, reward, use_pixels, maps, fixed_maps):
+                a, b = ctx.Pipe()
+                p = ctx.Process(target=_worker, args=(b, kw), daemon=True)
+                p.start()
+                b.close()
+                self.conns.append(a)
+                self.procs.append(p)
+        except BaseException:
+            self.close()
+            raise
+
+    def _request(self, cmd, values):
+        if self.closed:
+            raise RuntimeError("environment pool closed")
+        if len(values) != self.n:
+            raise ValueError("one value per worker required")
+        for c, value in zip(self.conns, values):
+            c.send((cmd, value))
+        result = []
+        for c in self.conns:
+            if not c.poll(self.timeout):
+                raise TimeoutError(f"environment worker timed out during {cmd}")
+            value = c.recv()
+            if isinstance(value, dict) and "worker_error" in value:
+                raise RuntimeError(value["worker_error"])
+            result.append(value)
+        return result
 
     def reset(self, seeds=None):
-        for i, c in enumerate(self.conns):
-            c.send(("reset", None if seeds is None else seeds[i]))
-        return [c.recv() for c in self.conns]
+        return self._request("reset", [None] * self.n if seeds is None else seeds)
 
     def step(self, actions):
-        for c, a in zip(self.conns, actions):
-            c.send(("step", int(a)))
-        return [c.recv() for c in self.conns]
+        return self._request("step", [int(a) for a in actions])
 
     def set_global_step(self, step):
-        for c in self.conns:
-            c.send(("set_step", int(step)))
+        self._request("set_step", [int(step)] * self.n)
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         for c in self.conns:
-            c.send(("close", None))
+            try:
+                c.send(("close", None))
+            except (OSError, EOFError):
+                pass
+            c.close()
         for p in self.procs:
-            p.join(timeout=10)
+            p.join(timeout=2)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
 
 
 def stack_feats(outs, key="f"):
@@ -231,19 +291,15 @@ def stack_feats(outs, key="f"):
     return {k: np.stack([f[k] for f in fs]) for k in fs[0]}
 
 
-def ram_stats(envs: "ProcEnvs") -> dict:
-    """Memory of the learner + env workers (Linux). Uses PSS (proportional set size: shared pages split
-    among the processes sharing them), so the sum is not inflated by pages shared with the forkserver
-    parent, unlike summing RSS. Logged every update so the job's real footprint is measured."""
-    import os
+def ram_stats(envs):
     def pss(pid):
         try:
-            with open(f"/proc/{pid}/smaps_rollup") as fh:
-                for line in fh:
+            with open(f"/proc/{pid}/smaps_rollup") as stream:
+                for line in stream:
                     if line.startswith("Pss:"):
                         return int(line.split()[1]) * 1024
         except OSError:
-            return 0
+            pass
         return 0
     if not os.path.exists("/proc/self/smaps_rollup"):
         return {}

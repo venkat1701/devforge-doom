@@ -1,0 +1,40 @@
+{
+ "algo": "ppo",
+ "seed": 0,
+ "total_steps": 20000000,
+ "num_envs": 256,
+ "episode_ticks": [
+  2100,
+  4200
+ ],
+ "fast_env": false,
+ "torch_threads": 1,
+ "model": {
+  "hidden": 512,
+  "embed": 512,
+  "use_map": false,
+  "use_episodic": false,
+  "use_pixels": true,
+  "aux": false
+ },
+ "asymmetric_critic": true,
+ "ppo": {
+  "lr": 0.00025,
+  "anneal_lr": true,
+  "num_steps": 128,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "num_minibatches": 16,
+  "update_epochs": 4,
+  "norm_adv": true,
+  "clip_coef": 0.1,
+  "clip_vloss": true,
+  "ent_coef": 0.01,
+  "vf_coef": 0.5,
+  "max_grad_norm": 0.5,
+  "critic_warmup_updates": 10
+ },
+ "save_every_updates": 50,
+ "reward": "progress_v4",
+ "training_maps": "suite:train"
+}

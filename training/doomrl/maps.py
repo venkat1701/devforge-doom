@@ -1,20 +1,10 @@
-"""Map suites and curriculum.
-
-Three disjoint suites (review fix: the earlier probes reused MAP17-24 for every decision, which made it
-a development set, not a test set):
-  train  Freedoom 2 MAP01-16, Freedoom 1 E1M1-E4M9 (36 maps, 2-6 locked doors each on the ones checked),
-         and the stock ViZDoom scenarios (combat / navigation drills)
-  dev    Freedoom 2 MAP17-24: model selection, ablations, checkpoints
-  test   Freedoom 2 MAP25-32: UNTOUCHED until the final report. evaluate.py refuses to run it unless
-         --final is passed, and logs every time it is used.
-
-Curriculum (Wu & Tian 2017 won ViZDoom 2016 Track 1 with A3C + curriculum, see training/docs/DESIGN.md):
-stages are sampled by global env step; each stage is a weighted pool of maps.
-"""
+"""Disjoint map suites and uniform sampling from an explicit training manifest."""
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import json
 
 import vizdoom as vd
 
@@ -28,37 +18,64 @@ FD1_ALL = [(FD1, f"E{e}M{m}") for e in range(1, 5) for m in range(1, 10)]
 DRILLS = [(SCEN(n), "MAP01") for n in ("defend_the_center", "defend_the_line", "health_gathering",
                                         "my_way_home", "deadly_corridor")]
 
+# Procedurally generated small maps (training/mapgen/generate.py; disjoint seed ranges per split).
+GEN_DIR = Path(__file__).resolve().parents[1] / "maps_gen"
+TWO_ROOMS = (str(Path(__file__).resolve().parents[2] / "maps" / "two_rooms.wad"), "MAP01")
+
+
+_LAYOUTS = None
+
+
+def gen_layout(wad, map_name):
+    """Layout of a generated map (training-only route shaping), or None for any other map."""
+    global _LAYOUTS
+    if _LAYOUTS is None:
+        _LAYOUTS = {}
+        for index in GEN_DIR.glob("*_maps.json"):
+            for m in json.loads(index.read_text()):
+                if "layout" in m:
+                    _LAYOUTS[(str(GEN_DIR / m["wad"]), m["map"])] = m["layout"]
+    return _LAYOUTS.get((str(wad), map_name))
+
+
+def _gen(split):
+    index = GEN_DIR / f"{split}_maps.json"
+    if not index.exists():
+        return []
+    return [(str(GEN_DIR / m["wad"]), m["map"]) for m in json.loads(index.read_text())]
+
+
 SUITES = {
-    "train": FD2_TRAIN + FD1_ALL + DRILLS,
+    "train_base": FD2_TRAIN + FD1_ALL + DRILLS,   # the default manifest (configs/train_maps.json)
+    "train": FD2_TRAIN + FD1_ALL + DRILLS + _gen("train"),
+    "gen_train": _gen("train"),
+    "gen_dev": _gen("dev") + [TWO_ROOMS],   # held out; two_rooms is the template's (non-evaluation) test map
+    "gen_test": _gen("test"),               # reserved for the final pick
     "dev": [(FD2, f"MAP{i:02d}") for i in range(17, 25)],
     "test": [(FD2, f"MAP{i:02d}") for i in range(25, 33)],
 }
 
-# (start_step, [(maps, weight), ...]): later stages keep earlier material in the mix
-CURRICULUM = [
-    (0, [(DRILLS, 0.5), (FD2_TRAIN[:6] + FD1_ALL[:6], 0.5)]),
-    (2_000_000, [(DRILLS, 0.15), (FD2_TRAIN[:10] + FD1_ALL[:18], 0.85)]),
-    (6_000_000, [(DRILLS, 0.05), (FD2_TRAIN + FD1_ALL, 0.95)]),
-]
+def resolve_training_maps(manifest):
+    if manifest is None:
+        manifest = Path(__file__).parents[1] / "configs" / "train_maps.json"
+    if isinstance(manifest, str) and manifest.startswith("suite:"):
+        manifest = SUITES[manifest.split(":", 1)[1]]
+    elif isinstance(manifest, (str, Path)):
+        manifest = json.loads(Path(manifest).read_text())
+    maps = [(str(Path(w) if Path(w).is_absolute() else Path(_V) / w), m) for w, m in manifest]
+    if not maps or len(set(maps)) != len(maps) or not set(maps) <= set(SUITES["train"]):
+        raise ValueError("training manifest must contain unique train-suite maps only")
+    return maps
 
 
-def stage_at(step: int, curriculum=CURRICULUM):
-    pools = curriculum[0][1]
-    for start, p in curriculum:
-        if step >= start:
-            pools = p
-    return pools
-
-
-def sample_map(rng, step: int, curriculum=CURRICULUM):
-    pools = stage_at(step, curriculum)
-    w = [wt for _, wt in pools]
-    maps = pools[rng.choice(len(pools), p=[x / sum(w) for x in w])][0]
-    return maps[rng.integers(len(maps))]
+def sample_map(rng, step=0, maps=None):
+    pool = resolve_training_maps(None) if maps is None else maps
+    return pool[int(rng.integers(len(pool)))]
 
 
 def assert_disjoint() -> None:
     tr, dv, te = (set(SUITES[k]) for k in ("train", "dev", "test"))
     assert not (tr & dv) and not (tr & te) and not (dv & te), "suites overlap"
-    cur = {m for _, pools in CURRICULUM for maps, _ in pools for m in maps}
-    assert cur <= tr, "curriculum uses non-train maps"
+    gd, gt = set(SUITES["gen_dev"]), set(SUITES["gen_test"])
+    assert not (tr & gd) and not (tr & gt) and not (gd & gt), "generated suites overlap"
+    assert set(resolve_training_maps(None)) <= tr, "manifest uses non-train maps"

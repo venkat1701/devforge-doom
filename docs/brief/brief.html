@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>DOOM Agent Brief</title>
+<style>
+@page { size: A4; margin: 13mm 14mm; }
+body { font: 9.6pt/1.32 "Helvetica Neue", Arial, sans-serif; color: #111; margin: 0; }
+h1 { font-size: 15pt; margin: 0 0 2px; } .sub { color: #444; margin: 0 0 8px; font-size: 9.4pt; }
+h2 { font-size: 11pt; margin: 9px 0 3px; border-bottom: 1px solid #bbb; padding-bottom: 1px; }
+p { margin: 3px 0; } ul { margin: 3px 0 3px 16px; padding: 0; } li { margin: 1px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 8.8pt; margin: 4px 0; }
+th, td { border: 1px solid #ccc; padding: 2px 5px; text-align: left; vertical-align: top; }
+th { background: #f0f0f0; } td.n { text-align: right; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pipe { font-family: Menlo, monospace; font-size: 8.4pt; background: #f6f6f6; padding: 4px 6px; border-radius: 3px; }
+.page2 { break-before: page; }
+.note { color: #555; font-size: 8.6pt; }
+</style></head><body>
+
+<h1>Learning to Play DOOM Zero-Shot: Recurrent PPO with a Tiered Map Curriculum and Scoring-Aligned Shaping</h1>
+<p class="sub">Track 1 "Can It Play DOOM?" &middot; ViZDoom 1.3.3, Freedoom 2, skill 3 &middot; official <code>doom_env</code> observations only</p>
+
+<h2>1. USP</h2>
+<ul>
+<li><b>Procedural tiered curriculum that mirrors the hidden suite.</b> Our own UDMF generator builds small maps in the four evaluation tiers (combat arenas; multi-room with doors; keycard &rarr; locked door &rarr; exit; gauntlet) using the template map's door/exit conventions. Every map is validated in the real engine against the official wrapper's own door/lock parser. Full Freedoom levels cannot be finished inside 60&ndash;120 s, so without this the agent almost never experiences an exit or a key.</li>
+<li><b>Training-only reward aligned with every scoring category</b>, with potential-based route shaping toward the next required objective (Ng, Harada &amp; Russell 1999) and an aim-cone ammunition-discipline term computed from the agent's own sensors.</li>
+<li><b>Fast, auditable training.</b> Background engine prefetch and 256 parallel simulators raised throughput from ~1.3k to ~6.5k transitions/s; every checkpoint is selected on fixed-seed, held-out maps through the real submission agent.</li>
+</ul>
+
+<h2>2. Neural architecture</h2>
+<div class="pipe">rays(64&times;7) &rarr; circular Conv1d&times;3 &rarr; 256 &nbsp;|&nbsp; entities(32&times;(5+type emb)) &rarr; shared MLP &rarr; mean &amp; max pool &rarr; 64+64<br>
+vitals(17) + previous action emb(16) &rarr; 64 &nbsp;|&nbsp; RGB-D 4&times;60&times;80 &rarr; CNN &rarr; zero-initialised projection (added)<br>
+fusion 448 &rarr; FC 512 &rarr; <b>GRU 512</b>  &rarr; policy (56 button combinations) &nbsp;&middot;&nbsp; value head (training only)</div>
+<ul>
+<li><b>Variable numbers of enemies:</b> entities are encoded by a shared MLP and pooled (mean and max), so the network is permutation-invariant and handles 0&ndash;32 visible objects.</li>
+<li><b>Ego-centric rays</b> (64 directions, hit type wall/door/locked/enemy/item) use circular convolutions; no global coordinates are observed.</li>
+<li><b>Training-only signals:</b> privileged state is used only to compute the training reward; the value head is dropped at export and the submitted policy uses the official observation only.</li>
+<li><b>Pixel encoder:</b> Nature-DQN CNN on RGB-D. A residual IMPALA encoder was trained in parallel and matched it within noise (held-out proxy 17.31 vs 17.60, 800 episodes each), so the smaller encoder was kept.</li>
+<li>Inference: p50 1.1 / p99 1.4 ms per decision (budget 40 ms), 2.64M parameters.</li>
+</ul>
+
+<h2>3. Spatial memory</h2>
+<p>The agent never sees global positions, so memory must be learned. The 512-unit GRU carries an episode-long recurrent state (reset only at episode start). The submitted model has no explicit map or pose memory; all spatial knowledge lives in the recurrent state. The tier-3 skill &ndash; remembering a locked door after finding its key &ndash; was measured directly: held-out locked-door openings rose from 0.04 to 0.74 per episode once the curriculum contained key&ndash;door maps.</p>
+
+<div class="page2"></div>
+<h2>4. Training &amp; exploration pipeline</h2>
+<div class="cols"><div>
+<p><b>Algorithm.</b> Synchronous recurrent PPO (clip 0.1, GAE &lambda;=0.95, &gamma;=0.99, 128-step rollouts, 4 epochs, Adam 2.5e-4 annealed), 64&ndash;256 simulator processes with background prefetch of the next episode's engine. Runs warm-start from the previous best checkpoint (weights carried over).</p>
+<p><b>Maps.</b> 240 generated maps (tiers 1&ndash;4) + 41 Freedoom 1/2 levels + 5 ViZDoom scenarios. 24 generated maps + the template map and Freedoom 2 MAP17&ndash;24 are held out for selection; another 24 generated maps and MAP25&ndash;32 are reserved for one final check.</p>
+<p><b>Exploration.</b> Episodic count-based coverage bonus (new 128-unit cell), potential-based route shaping toward the next required objective, and mild sampling at inference (temperature 0.25), which halved back-and-forth looping between two rooms (6 &rarr; 3 of 42 tier 2&ndash;4 episodes) compared with greedy decoding.</p>
+</div><div>
+<table><tr><th>Training reward term (privileged state, training only)</th><th>Weight</th></tr>
+<tr><td>Official wrapper: exit / death / kill</td><td class="n">+1 / &minus;1 / +0.1</td></tr>
+<tr><td>Exit bonus (+ health and time remaining)</td><td class="n">+2 (+0.25 +0.25)</td></tr>
+<tr><td>Keycard / door opened / locked door opened</td><td class="n">+0.5 / +0.1 / +1.0</td></tr>
+<tr><td>New area (128&times;128 cell, once per episode)</td><td class="n">+0.025</td></tr>
+<tr><td>Extra per kill / damage taken per HP</td><td class="n">+0.05 / &minus;0.002</td></tr>
+<tr><td>ATTACK press / round spent with no enemy in &plusmn;8&deg; aim cone</td><td class="n">&minus;0.01 / &minus;0.05</td></tr>
+<tr><td>Fists selected while holding ammo / per step</td><td class="n">&minus;0.005 / &minus;0.001</td></tr>
+<tr><td>Route potential &Phi; = &minus;remaining route / 2000 (generated maps)</td><td class="n">&Phi;(s&prime;) &minus; &Phi;(s)</td></tr></table>
+</div></div>
+
+<h2>5. Results (held-out, fixed seeds, real submission agent)</h2>
+<table>
+<tr><th>Checkpoint</th><th>Exit</th><th>Keys</th><th>Locked doors</th><th>Doors</th><th>Kills</th><th>Deaths</th><th>Ended out of ammo</th><th>Areas</th></tr>
+<tr><td>Official reward only (3.7M steps)</td><td class="n">0.03</td><td class="n">0.26</td><td class="n">0.00</td><td class="n">0.09</td><td class="n">0.97</td><td class="n">0.11</td><td class="n">&ndash;</td><td class="n">12.6</td></tr>
+<tr><td>+ category shaping, Freedoom only (10.6M)</td><td class="n">0.27</td><td class="n">0.67</td><td class="n">0.04</td><td class="n">1.20</td><td class="n">1.82</td><td class="n">0.09</td><td class="n">&ndash;</td><td class="n">23.3</td></tr>
+<tr><td>+ route potential (v4, 51.6M) + mask, T0 &middot; 300 ep</td><td class="n">0.81</td><td class="n">0.80</td><td class="n">0.72</td><td class="n">1.81</td><td class="n">2.87</td><td class="n">0.10</td><td class="n">0.22</td><td class="n">25.7</td></tr>
+<tr><td>IMPALA encoder + v7, 47.9M, T0.25 &middot; 800 ep</td><td class="n">0.83</td><td class="n">0.81</td><td class="n">0.72</td><td class="n">1.81</td><td class="n">2.67</td><td class="n">0.03</td><td class="n">0.00</td><td class="n">24.7</td></tr>
+<tr><td><b>Submitted: v7 trigger discipline, 67.2M, T0.25</b> &middot; 800 ep</td><td class="n"><b>0.84</b></td><td class="n">0.80</td><td class="n"><b>0.74</b></td><td class="n">1.82</td><td class="n">2.79</td><td class="n">0.04</td><td class="n">0.00</td><td class="n">26.0</td></tr>
+<tr><td>Submitted, reserved generated test maps (run once) &middot; 288 ep</td><td class="n">0.83</td><td class="n">0.77</td><td class="n">0.74</td><td class="n">1.51</td><td class="n">3.07</td><td class="n">0.05</td><td class="n">0.01</td><td class="n">23.8</td></tr>
+</table>
+<p class="note">25 held-out maps (24 generated, all tiers, + template two_rooms), 2 tick caps; 2 seeds (100 episodes) unless stated. Rows from v4 onward use the inference action mask. Firing: the v7 trigger penalties cut ATTACK presses from 51% to 21% of decisions and shots with no enemy in the aim cone from 52% to 7%, while exits rose (0.81 &rarr; 0.84). Reserved Freedoom 2 MAP25&ndash;32 (96 episodes, run once): 0 exits, 2.2 kills, 0.54 deaths; full-length levels remain unsolved.</p>
+
+<h2>6. Rules compliance</h2>
+<p>Every action is chosen by the trained network from the official observation dictionary. Privileged state (positions, keys, sector heights) is used only in the training reward and the training-only critic. No scripted control, path planner or aimbot exists in <code>submission/</code>. At inference one fixed, state-independent action combination (SELECT_NEXT_WEAPON alone) is removed from the vocabulary, which cut time spent on fists while holding ammo from 41% to 7%; the network still chooses every action among the other 55. Evaluation runs the vanilla engine; curriculum maps are used only for training.</p>
+
+<h2>7. Limitations and next steps</h2>
+<ul>
+<li>Full-length Freedoom levels remain hard (no exits within the cap): long-range navigation needs stronger memory, e.g. a learned ego-centric occupancy grid.</li>
+<li>The binary turn buttons give a minimum turn of ~7&ndash;14&deg; per decision; aiming relies on timing shots.</li>
+<li>Next: a learned ego-centric occupancy map fed to the policy (spatial memory for key&ndash;door backtracking), asynchronous PPO (the lockstep learner, not the CPU, limits throughput), behaviour cloning from scripted demonstrations on key&ndash;door maps, and hierarchical sub-goal policies.</li>
+</ul>
+</body></html>

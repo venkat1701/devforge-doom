@@ -51,5 +51,9 @@ def main() -> int:
     return 0 if ok else 1
 
 
+def test_segmented_core_equivalence():
+    assert main() == 0
+
+
 if __name__ == "__main__":
     sys.exit(main())

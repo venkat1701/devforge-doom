@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DOOM PPO monitor</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header><h1>DOOM PPO training monitor</h1><span id="stale" class="badge hidden">STALE</span>
+<span class="note">Read-only. No Stop control: training stops itself at its runtime cap and is controlled via SSH.</span></header>
+<section class="grid">
+ <div class="panel"><h2>Training worker (live rollout)</h2>
+  <img id="train-img" class="hidden" alt="live training frame" width="480" height="360">
+  <div id="train-frame" class="unavail">checking...</div></div>
+ <div class="panel"><h2>CHECKPOINT PLAYBACK &mdash; not the live training rollout</h2>
+  <img id="spec" alt="spectator frame" width="480" height="360">
+  <div id="spec-meta" class="meta">waiting for first frame...</div></div>
+ <div class="panel"><h2>Progress</h2>
+  <div class="bar"><div id="bar"></div></div>
+  <table id="stats"></table></div>
+</section>
+<section class="grid">
+ <div class="panel wide"><h2>Fixed-seed evaluation on held-out maps (real submission agent; not training data)</h2>
+  <table id="evals"></table>
+  <div class="meta">Dev suite = Freedoom 2 MAP17-24, never trained on. proxy_score is our stand-in; the competition weights are private.</div></div>
+ <div class="panel"><h2>Reward breakdown (training, last 500 episodes)</h2><table id="shaping"></table>
+  <div class="meta">Damage dealt and ammo use are not exposed by the wrapper's privileged state; not shown.</div></div>
+</section>
+<section id="charts" class="charts"></section>
+<script src="/app.js"></script></body></html>

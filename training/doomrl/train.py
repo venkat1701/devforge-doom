@@ -1,6 +1,6 @@
 """Training entry point.
 
-    uv run --group train python -m doomrl.train --config training/configs/ppo_map.json --out training/runs/ppo_map_s0
+    uv run --group train python -m training.doomrl.train --config training/configs/ppo_learned.json --out training/runs/learned
 
 (run from the repo root with PYTHONPATH=training:submission, or use the provided scripts/train.sh)
 Writes <out>/model.pt + model_config.json (submission-ready), step-tagged checkpoints, episodes.jsonl,
@@ -34,15 +34,19 @@ class Logger:
         self.recent.append(ep)
         self.n += 1
         if self.n % self.every == 0:
-            keys = ("cells", "kills", "keys", "doors", "unlocks", "exit", "dead", "return")
+            keys = ("kills", "keys", "exit", "dead", "timeout", "return")
             m = {k: sum(float(e[k]) for e in self.recent) / len(self.recent) for k in keys}
             print(f"[{(time.time() - self.t0) / 60:6.1f} min] step {steps:>10,} | " +
                   " ".join(f"{k} {v:.2f}" for k, v in m.items()), flush=True)
             self.ep_f.flush()
 
     def update(self, steps: int, stats: dict):
-        self.up_f.write(json.dumps(dict(stats, global_step=steps)) + "\n")
+        self.up_f.write(json.dumps(dict(stats, global_step=steps), allow_nan=False) + "\n")
         self.up_f.flush()
+
+    def close(self):
+        self.ep_f.close()
+        self.up_f.close()
 
 
 def main():
@@ -56,25 +60,33 @@ def main():
                     "kept on the command line so infrastructure addresses never land in committed configs")
     ap.add_argument("--init_from", default=None, help="warm start from a model.pt / model_<step>.pt")
     ap.add_argument("--start_step", type=int, default=None, help="global step of the warm-start checkpoint")
+    ap.add_argument("--init_config", default=None, help="explicit source model configuration for migration")
+    ap.add_argument("--allow_map_removal", action="store_true")
+    ap.add_argument("--resume", default=None, help="trusted full learner checkpoint; starts fresh simulator episodes")
+    ap.add_argument("--max_seconds", type=float, default=None, help="stop between complete updates")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    for k in ("seed", "total_steps", "num_envs", "remote_envs", "init_from", "start_step"):
+    for k in ("seed", "total_steps", "num_envs", "remote_envs", "init_from", "start_step",
+              "init_config", "resume", "max_seconds"):
         if getattr(a, k) is not None:
             cfg[k] = getattr(a, k)
+    cfg["allow_map_removal"] = a.allow_map_removal
+    if cfg.get("max_seconds") is not None and cfg["max_seconds"] <= 0:
+        raise SystemExit("max_seconds must be positive")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     from doomrl.maps import assert_disjoint
     assert_disjoint()
     log = Logger(out)
-    if cfg["algo"] == "ppo":
+    try:
+        if cfg["algo"] != "ppo":
+            raise SystemExit("this learned-agent training entry point supports PPO only")
         from doomrl.ppo import train
-    elif cfg["algo"] == "drqn":
-        from doomrl.drqn import train
-    else:
-        raise SystemExit(f"unknown algo {cfg['algo']}")
-    train(cfg, out, log)
+        train(cfg, out, log)
+    finally:
+        log.close()
 
 
 if __name__ == "__main__":
