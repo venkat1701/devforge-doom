@@ -1,14 +1,9 @@
-"""Evaluation entry point. The scorer instantiates DoomAgent from this file (docs/CONTRACT.md §6).
-
-Every action comes from the trained network (docs/RULES.md §1). The code around it only encodes
-observations (odometry and the ray-built map are deterministic preprocessing of rays, velocities and
-the agent's own previous buttons) and maps the chosen discrete action to the 9 buttons.
-
-Weights: submission/weights/model.pt + model_config.json (written by training/doomrl/train.py).
-"""
+"""Competition entry point: learned observation encoders and recurrent memory only."""
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,14 +14,18 @@ SUBMISSION_DIR = Path(__file__).resolve().parent
 WEIGHTS_DIR = SUBMISSION_DIR / "weights"
 sys.path.insert(0, str(SUBMISSION_DIR))
 
-from doom_model import ACTIONS, AgentNet, AgentSideFeatures, ModelConfig  # noqa: E402
+from doom_model import ACTIONS, AgentSideFeatures  # noqa: E402
+from doom_model.artifacts import load_policy  # noqa: E402
+
+# MultiBinary(9) button order of the official action contract (docs/CONTRACT.md; doom_env.spaces.BUTTONS).
+BUTTONS = ("MOVE_FORWARD", "MOVE_BACKWARD", "MOVE_LEFT", "MOVE_RIGHT", "TURN_LEFT", "TURN_RIGHT",
+           "ATTACK", "USE", "SELECT_NEXT_WEAPON")
 
 
 class DoomAgent:
     def __init__(self, observation_space, action_space, device: str):
         self.action_space = action_space
-        # Batch-1 inference of a ~1M-parameter net is ~0.5 ms on one CPU thread (training/probes/latency.py),
-        # well inside the 40 ms/step budget; CPU avoids CUDA start-up time and the 2 GB VRAM cap.
+        # CPU avoids CUDA allocation; the actual exported model must pass the remote validator.
         self.device = torch.device("cpu")
         torch.set_num_threads(1)
         self.load_weights(WEIGHTS_DIR)
@@ -37,19 +36,32 @@ class DoomAgent:
         """Build the network from <dir>/model_config.json and load <dir>/model.pt (also used by
         training/doomrl/evaluate.py to evaluate checkpoints through this exact class)."""
         weights_dir = Path(weights_dir)
-        cfg_path, w_path = weights_dir / "model_config.json", weights_dir / "model.pt"
-        # Fail closed (review fix): never silently run an untrained network.
-        if not (cfg_path.is_file() and w_path.is_file()):
-            raise FileNotFoundError(f"trained weights missing: need {cfg_path} and {w_path}")
-        self.cfg = ModelConfig.load(cfg_path)
-        self.net = AgentNet(self.cfg).eval()
-        state = torch.load(w_path, map_location="cpu", weights_only=True)
-        missing, unexpected = self.net.load_state_dict(state, strict=False)
-        # only heads the agent never evaluates may be missing (critic / aux); never core weights
-        bad = [k for k in missing if not k.startswith(("v.", "aux."))]
-        if bad or unexpected:
-            raise RuntimeError(f"weights do not match config: missing={bad} unexpected={unexpected}")
+        self.net, self.cfg, self.manifest = load_policy(weights_dir)
         self.greedy = self.cfg.head == "q"
+        # Inference temperature for the learned policy (1.0 = sample as trained, 0 = most likely action).
+        # Optional weights_dir/inference.json {"temperature": t}; DOOM_AGENT_TEMPERATURE overrides (experiments).
+        self.temperature = 1.0
+        cfg_file = weights_dir / "inference.json"
+        if cfg_file.exists():
+            self.temperature = float(json.loads(cfg_file.read_text()).get("temperature", 1.0))
+        if os.environ.get("DOOM_AGENT_TEMPERATURE"):
+            self.temperature = float(os.environ["DOOM_AGENT_TEMPERATURE"])
+        if not (self.temperature >= 0 and np.isfinite(self.temperature)):
+            raise ValueError("temperature must be a finite non-negative number")
+        # Fixed action-vocabulary restriction (not state-dependent): combinations pressing any listed button are never
+        # chosen. inference.json {"masked_buttons": [...]}; DOOM_AGENT_MASK="A,B" overrides (experiments).
+        masked = []
+        if cfg_file.exists():
+            masked = list(json.loads(cfg_file.read_text()).get("masked_buttons", []))
+        if os.environ.get("DOOM_AGENT_MASK") is not None:
+            masked = [b for b in os.environ["DOOM_AGENT_MASK"].split(",") if b]
+        unknown = set(masked) - set(BUTTONS)
+        if unknown:
+            raise ValueError(f"unknown buttons to mask: {sorted(unknown)}")
+        cols = [BUTTONS.index(b) for b in masked]
+        self.action_mask = torch.tensor([bool(np.any(ACTIONS[i][cols])) if cols else False for i in range(len(ACTIONS))])
+        if bool(self.action_mask.all()):
+            raise ValueError("masking leaves no action")
         self.feats = AgentSideFeatures(use_map=self.cfg.use_map, use_pixels=self.cfg.use_pixels)
 
     def reset(self) -> None:
@@ -59,7 +71,6 @@ class DoomAgent:
         self.h = self.net.init_state(1)
         self.t = -1
         self.last_action = 0
-        self.bank_h, self.bank_pose, self.bank_t = [], [], []
 
     @torch.no_grad()
     def act(self, observation: dict) -> np.ndarray:
@@ -67,24 +78,20 @@ class DoomAgent:
         f = self.feats.reset(observation) if self.t == 0 else self.feats.step(self.last_action, observation)
         o = {k: torch.from_numpy(np.asarray(v))[None, None] for k, v in f.items()}
         starts = torch.tensor([[1.0 if self.t == 0 else 0.0]])
-        mem = None
-        if self.cfg.use_episodic:
-            H = self.cfg.hidden
-            n = len(self.bank_h)
-            mem = {
-                "t_idx": torch.tensor([[self.t]]),
-                "bank_h": torch.stack(self.bank_h)[:, None] if n else torch.zeros(0, 1, H),
-                "bank_pose": torch.from_numpy(np.stack(self.bank_pose))[:, None] if n else torch.zeros(0, 1, 3),
-                "bank_t": torch.tensor(self.bank_t)[:, None] if n else torch.zeros(0, 1, dtype=torch.long),
-                "n_valid": torch.tensor([[n]]),
-            }
-        out = self.net(o, self.h, starts, mem)
+        out = self.net.policy(o, self.h, starts)
         self.h = out["h"]
-        if self.cfg.use_episodic and self.t % self.cfg.episodic_every == 0 and len(self.bank_h) < self.cfg.episodic_slots:
-            self.bank_h.append(out["core"][0, 0].clone()); self.bank_pose.append(f["pose"]); self.bank_t.append(self.t)
+        if bool(self.action_mask.any()):
+            key = "q" if self.greedy else "logits"
+            out[key] = out[key].masked_fill(self.action_mask, float("-inf"))
+        scores = out["q"] if self.greedy else out["logits"]
+        if not torch.isfinite(scores[..., ~self.action_mask]).all():
+            raise ValueError("nonfinite policy output")
         if self.greedy:
             a = int(out["q"][0, 0].argmax())
+        elif self.temperature == 0:
+            a = int(out["logits"][0, 0].argmax())
         else:
-            a = int(torch.multinomial(out["logits"][0, 0].softmax(-1), 1, generator=self.gen))
+            probs = (out["logits"][0, 0] / self.temperature).softmax(-1)
+            a = int(torch.multinomial(probs, 1, generator=self.gen))
         self.last_action = a
         return ACTIONS[a].astype(np.int8).copy()

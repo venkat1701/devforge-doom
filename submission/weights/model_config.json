@@ -1,0 +1,15 @@
+{
+  "hidden": 512,
+  "embed": 512,
+  "use_map": false,
+  "use_episodic": false,
+  "use_pixels": true,
+  "episodic_every": 4,
+  "episodic_slots": 288,
+  "head": "actor_critic",
+  "privileged_dim": 0,
+  "aux": false,
+  "memory_slots": 0,
+  "memory_dim": 64,
+  "pixel_encoder": "nature"
+}
